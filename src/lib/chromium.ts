@@ -1,4 +1,4 @@
-import { Browser, BrowserContext, Page } from 'playwright';
+import { BrowserContext, Page } from 'playwright';
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import config from '../config';
@@ -11,15 +11,12 @@ chromium.use(stealthPlugin);
 
 export type BotType = 'microsoft' | 'google' | 'zoom';
 
-function attachBrowserErrorHandlers(browser: Browser, context: BrowserContext, page: Page, correlationId: string) {
+// Removed 'Browser' since launchPersistentContext directly returns a BrowserContext
+function attachBrowserErrorHandlers(context: BrowserContext, page: Page, correlationId: string) {
   const log = getCorrelationIdLog(correlationId);
 
-  browser.on('disconnected', () => {
-    console.log(`${log} Browser has disconnected!`);
-  });
-
   context.on('close', () => {
-    console.log(`${log} Browser has closed!`);
+    console.log(`${log} Browser context has closed!`);
   });
 
   page.on('crash', (page) => {
@@ -31,7 +28,8 @@ function attachBrowserErrorHandlers(browser: Browser, context: BrowserContext, p
   });
 }
 
-async function launchBrowserWithTimeout(launchFn: () => Promise<Browser>, timeoutMs: number, correlationId: string): Promise<Browser> {
+// Updated to return Promise<BrowserContext> instead of Promise<Browser>
+async function launchContextWithTimeout(launchFn: () => Promise<BrowserContext>, timeoutMs: number, correlationId: string): Promise<BrowserContext> {
   let timeoutId: NodeJS.Timeout;
   let finished = false;
 
@@ -40,7 +38,7 @@ async function launchBrowserWithTimeout(launchFn: () => Promise<Browser>, timeou
     timeoutId = setTimeout(() => {
       if (!finished) {
         finished = true;
-        reject(new Error(`Browser launch timed out after ${timeoutMs}ms`));
+        reject(new Error(`Browser context launch timed out after ${timeoutMs}ms`));
       }
     }, timeoutMs);
 
@@ -50,12 +48,12 @@ async function launchBrowserWithTimeout(launchFn: () => Promise<Browser>, timeou
         if (!finished) {
           finished = true;
           clearTimeout(timeoutId);
-          console.log(`${getCorrelationIdLog(correlationId)} Browser launch function success!`);
+          console.log(`${getCorrelationIdLog(correlationId)} Browser context launch function success!`);
           resolve(result);
         }
       })
       .catch(err => {
-        console.error(`${getCorrelationIdLog(correlationId)} Error launching browser`, err);
+        console.error(`${getCorrelationIdLog(correlationId)} Error launching browser context`, err);
         if (!finished) {
           finished = true;
           clearTimeout(timeoutId);
@@ -69,12 +67,13 @@ async function createBrowserContext(url: string, correlationId: string, botType:
   const size = { width: 1280, height: 720 };
 
   // Base browser args used by all bots
-  const baseBrowserArgs: string[] = [
+const baseBrowserArgs: string[] = [
+  '--no-sandbox',                  // CRITICAL FOR DOCKER
+    '--disable-dev-shm-usage',       // CRITICAL FOR DOCKER
+    '--disable-setuid-sandbox',
+    // --- YOUR EXISTING REQUIRED FLAGS ---
     '--enable-usermedia-screen-capturing',
     '--allow-http-screen-capture',
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-web-security',
     '--use-gl=angle',
     '--use-angle=swiftshader',
     `--window-size=${size.width},${size.height}`,
@@ -82,71 +81,73 @@ async function createBrowserContext(url: string, correlationId: string, botType:
     '--enable-features=MediaRecorder',
     '--enable-audio-service-out-of-process',
     '--autoplay-policy=no-user-gesture-required',
+    
+    // --- NEW PERFORMANCE & SPEED FLAGS ---
+    '--disable-extensions',                     // Stops Chrome from loading heavy extensions in the profile
+    '--no-proxy-server',                        // Bypasses any local proxy delays
+    '--disable-background-networking',          // Stops Chrome from calling home to Google for updates
+    '--disable-background-timer-throttling',    // Forces JS to run at full speed even in background
+    '--disable-backgrounding-occluded-windows', // Stops Chrome from sleeping tabs
+    '--disable-renderer-backgrounding',         // Keeps the renderer thread at high priority
+    '--disable-client-side-phishing-detection', // Turns off Google's slow security scanner
+    '--disable-sync',                           // Prevents it from trying to sync  bookmarks/history
+    '--metrics-recording-only',                 // Stops reporting metrics to Google
+    '--mute-audio',                             // (Optional) Mutes output audio to save processing
   ];
 
-  // Fake device args - only for Microsoft Teams
-  // Teams needs fake devices to interact with pre-join screen toggles,
-  // but actual recording is done via ffmpeg (X11 + PulseAudio)
   const fakeDeviceArgs: string[] = [
     '--use-fake-ui-for-media-stream',
     '--use-fake-device-for-media-stream',
   ];
 
-  // Google Meet and Zoom use browser-based recording (getDisplayMedia + MediaRecorder)
-  // and don't need fake devices:
-  // - Google Meet: clicks "Continue without microphone and camera"
-  // - Zoom: expects "Cannot detect your camera/microphone" notifications
   const browserArgs = botType === 'microsoft'
     ? [...baseBrowserArgs, ...fakeDeviceArgs]
     : baseBrowserArgs;
 
-  // Teams-specific display args: kiosk mode prevents address bar from showing in ffmpeg recording
-  // Google Meet and Zoom don't need this since they use tab capture (getDisplayMedia)
   const displayArgs = botType === 'microsoft'
     ? ['--kiosk', '--start-maximized']
     : [];
 
   console.log(`${getCorrelationIdLog(correlationId)} Launching browser for ${botType} bot (fake devices: ${botType === 'microsoft'})`);
 
-  const browser = await launchBrowserWithTimeout(
-    async () => await chromium.launch({
-      headless: false,
+  const linuxX11UserAgent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
+
+  // Use launchPersistentContext, combining the old launch() and newContext() properties
+  const context = await launchContextWithTimeout(
+    async () => await chromium.launchPersistentContext('./chrome-profile', {
+      headless: false, // Kept false for local Mac testing POC
       args: [
         ...browserArgs,
         ...displayArgs,
       ],
       ignoreDefaultArgs: ['--mute-audio'],
-      executablePath: config.chromeExecutablePath,
+executablePath: process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      permissions: ['camera', 'microphone'],
+      viewport: size,
+      ignoreHTTPSErrors: true,
+      // userAgent: linuxX11UserAgent,
+      ...(process.env.NODE_ENV === 'development' && {
+        recordVideo: {
+          dir: './debug-videos/',
+          size: size,
+        },
+      }),
     }),
     60000,
     correlationId
   );
 
-  const linuxX11UserAgent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
-  
-  const context = await browser.newContext({
-    permissions: ['camera', 'microphone'],
-    viewport: size,
-    ignoreHTTPSErrors: true,
-    userAgent: linuxX11UserAgent,
-    // Record video only in development for debugging
-    ...(process.env.NODE_ENV === 'development' && {
-      recordVideo: {
-        dir: './debug-videos/',
-        size: size,
-      },
-    }),
-  });
-
   // Grant permissions so Teams will play audio (Teams requires this unlike Google Meet)
   await context.grantPermissions(['microphone', 'camera'], { origin: url });
 
-  const page = await context.newPage();
+  // Persistent contexts open with a blank page by default. 
+  // We grab the existing one instead of creating a zombie tab.
+  const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
 
   // Attach common error handlers
-  attachBrowserErrorHandlers(browser, context, page, correlationId);
+  attachBrowserErrorHandlers(context, page, correlationId);
 
-  console.log(`${getCorrelationIdLog(correlationId)} Browser launched successfully!`);
+  console.log(`${getCorrelationIdLog(correlationId)} Browser launched successfully using persistent profile!`);
 
   return page;
 }
