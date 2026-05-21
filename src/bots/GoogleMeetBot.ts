@@ -12,6 +12,7 @@ export class GoogleMeetBot extends MeetBotBase {
   private _logger: Logger;
   private _correlationId: string;
 
+  
   constructor(logger: Logger, correlationId: string) {
     super();
     this.slightlySecretId = v4();
@@ -47,58 +48,111 @@ export class GoogleMeetBot extends MeetBotBase {
 
   private async joinMeeting({ url, teamId, userId, pushState }: Partial<JoinParams> & { pushState(state: BotStatus): void }): Promise<void> {
     this._logger.info('Launching persistent browser...');
-
-    // Launch the persistent profile
-    this.page = await createBrowserContext(url as string, this._correlationId, 'google');
-
-    this._logger.info('Navigating to Google Meet URL...');
-const meetUrlObj = new URL(url as string);
-    meetUrlObj.searchParams.set('authuser', '0');
-    const finalUrl = meetUrlObj.toString();
-    
-    await this.page.goto(finalUrl, { waitUntil: 'domcontentloaded' });
-
-    this._logger.info('Waiting for page to settle...');
-    await this.page.waitForTimeout(5000);
-
-    // 1. Dismiss any potential device tooltips or "Got it" modals that might block the UI
     try {
-      const gotItButtons = await this.page.locator('button', { hasText: 'Got it' }).all();
-      for (const btn of gotItButtons) {
-         if (await btn.isVisible()) {
-             await btn.click();
-             this._logger.info('Dismissed a "Got it" modal.');
-         }
-      }
-    } catch (e) {
-      // Ignore if not found
+      this.page = await createBrowserContext(url as string, this._correlationId, 'google');
+    } catch(error) {
+      this._logger.error('Failed to create browser context', { error });
+      throw error; // Re-throw to prevent continuing with undefined page
     }
 
-    // 2. Click "Join now" (Authenticated Enterprise Flow)
-    this._logger.info('Looking for "Join now" button...');
-    await retryActionWithWait(
-      'Clicking the "Join now" button',
-      async () => {
-        const joinButton = await this.page.locator('button', { hasText: /Join now/i }).first();
-        if (await joinButton.count() > 0 && await joinButton.isVisible()) {
-          await joinButton.click({ timeout: 5000 });
-          this._logger.info('Successfully clicked "Join now"!');
-        } else {
-          throw new Error('Join now button not visible yet...');
+    if (process.env.AUTH_COOKIES) {
+        try {
+            this._logger.info('Found AUTH_COOKIES in environment. Injecting into browser...');
+            const decodedCookies = Buffer.from(process.env.AUTH_COOKIES, 'base64').toString('utf-8');
+            const cookies = JSON.parse(decodedCookies);
+
+            if (Array.isArray(cookies)) {
+                // Normalize sameSite attribute for Playwright compatibility
+                const normalizedCookies = cookies.map((cookie: any) => {
+                    if (cookie.sameSite) {
+                        const sameSiteLower = cookie.sameSite.toLowerCase();
+                        if (sameSiteLower === 'no_restriction' || sameSiteLower === 'none') {
+                            cookie.sameSite = 'None';
+                        } else if (sameSiteLower === 'lax') {
+                            cookie.sameSite = 'Lax';
+                        } else if (sameSiteLower === 'strict') {
+                            cookie.sameSite = 'Strict';
+                        } else {
+                            // Remove sameSite if it is 'unspecified' or other invalid values
+                            delete cookie.sameSite;
+                        }
+                    }
+                    return cookie;
+                });
+
+                // Playwright requires cookies to be injected into the Context
+                await this.page.context().addCookies(normalizedCookies);
+                this._logger.info(`Successfully injected ${normalizedCookies.length} authentication cookies.`);
+            } else {
+                this._logger.warn('AUTH_COOKIES decoded JSON is not an array.');
+            }
+        } catch (error: any) {
+            this._logger.error('Failed to parse or inject AUTH_COOKIES', { 
+                message: error?.message, 
+                stack: error?.stack,
+                error
+            });
         }
-      },
-      this._logger,
-      3,
-      10000
-    );
+    } else {
+        this._logger.info('No AUTH_COOKIES provided. Proceeding as unauthenticated user.');
+    }
 
-    // Give it a moment to transition from the lobby to the actual meeting room
-    await this.page.waitForTimeout(5000);
-    pushState('joined');
-    this._logger.info('Bot has entered the meeting room. Native Workspace recording should trigger (if configured).');
+    try {
+      // Launch the persistent profile
 
-    // 3. Monitor Meeting State (Wait until meeting ends or bot is alone)
-    await this.monitorMeeting(teamId as string, userId as string);
+      this._logger.info('Navigating to Google Meet URL...');
+      const meetUrlObj = new URL(url as string);
+      meetUrlObj.searchParams.set('authuser', '0');
+      const finalUrl = meetUrlObj.toString();
+
+      await this.page.goto(finalUrl, { waitUntil: 'domcontentloaded' });
+      this._logger.info(`Successfully navigated to ${finalUrl}`);
+
+      this._logger.info('Waiting for page to settle...');
+      await this.page.waitForTimeout(5000);
+
+      // 1. Dismiss any potential device tooltips or "Got it" modals that might block the UI
+      try {
+        const gotItButtons = await this.page.locator('button', { hasText: 'Got it' }).all();
+        for (const btn of gotItButtons) {
+          if (await btn.isVisible()) {
+            await btn.click();
+            this._logger.info('Dismissed a "Got it" modal.');
+          }
+        }
+      } catch (e) {
+        this._logger.warn('No "Got it" modals found to dismiss.');
+      }
+
+      // 2. Click "Join now" (Authenticated Enterprise Flow)
+      this._logger.info('Looking for "Join now" button...');
+      await retryActionWithWait(
+        'Clicking the "Join now" button',
+        async () => {
+          const joinButton = await this.page.locator('button', { hasText: /Join now/i }).first();
+          if (await joinButton.count() > 0 && await joinButton.isVisible()) {
+            await joinButton.click({ timeout: 5000 });
+            this._logger.info('Successfully clicked "Join now"!');
+          } else {
+            throw new Error('Join now button not visible yet...');
+          }
+        },
+        this._logger,
+        3,
+        10000
+      );
+
+      // Give it a moment to transition from the lobby to the actual meeting room
+      await this.page.waitForTimeout(5000);
+      pushState('joined');
+      this._logger.info('Bot has entered the meeting room. Native Workspace recording should trigger (if configured).');
+
+      // 3. Monitor Meeting State (Wait until meeting ends or bot is alone)
+      await this.monitorMeeting(teamId as string, userId as string);
+    } catch (error) {
+      this._logger.error('Error during joinMeeting process', { error });
+      throw error;
+    }
   }
 
   private async monitorMeeting(teamId: string, userId: string): Promise<void> {

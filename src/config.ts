@@ -1,6 +1,36 @@
 import dotenv from 'dotenv';
 import { UploaderType } from './types';
+import fs from 'fs';
 dotenv.config();
+
+const getChromePath = (): string => {
+  const envPath = process.env.CHROME_PATH;
+  if (envPath && fs.existsSync(envPath)) {
+    return envPath;
+  }
+
+  // Fallback defaults based on OS if the envPath doesn't exist or is not set
+  if (process.platform === 'win32') {
+    const winPaths = [
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    ];
+    for (const p of winPaths) {
+      if (fs.existsSync(p)) {
+        return p;
+      }
+    }
+    return winPaths[0];
+  } else if (process.platform === 'darwin') {
+    return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  } else {
+    // Linux/Docker
+    return '/usr/bin/google-chrome';
+  }
+};
+
+const chromeExecutablePath = getChromePath();
+console.log('Using Chrome executable path:', chromeExecutablePath);
 
 const ENVIRONMENTS = [
   'production',
@@ -56,7 +86,7 @@ export default {
   maxRecordingDuration: process.env.MAX_RECORDING_DURATION_MINUTES ?
     Number(process.env.MAX_RECORDING_DURATION_MINUTES) :
     180, // There's an upper limit on meeting duration 3 hours
-  chromeExecutablePath: process.env.CHROME_PATH || '/usr/bin/google-chrome', // We use Google Chrome with Playwright for recording
+  chromeExecutablePath, // We use Google Chrome with Playwright for recording
   inactivityLimit: process.env.MEETING_INACTIVITY_MINUTES ? Number(process.env.MEETING_INACTIVITY_MINUTES) : 1,
   activateInactivityDetectionAfter: process.env.INACTIVITY_DETECTION_START_DELAY_MINUTES ? Number(process.env.INACTIVITY_DETECTION_START_DELAY_MINUTES) :  1,
   serviceKey: process.env.SCREENAPP_BACKEND_SERVICE_API_KEY,

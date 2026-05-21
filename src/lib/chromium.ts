@@ -2,12 +2,16 @@ import { BrowserContext, Page } from 'playwright';
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import config from '../config';
+import * as path from 'path';
 import { getCorrelationIdLog } from '../util/logger';
 
-const stealthPlugin = StealthPlugin();
-stealthPlugin.enabledEvasions.delete('iframe.contentWindow');
-stealthPlugin.enabledEvasions.delete('media.codecs');
-chromium.use(stealthPlugin);
+// Only use stealth plugin on non-Windows environments
+if (process.platform !== 'win32') {
+  const stealthPlugin = StealthPlugin();
+  stealthPlugin.enabledEvasions.delete('iframe.contentWindow');
+  stealthPlugin.enabledEvasions.delete('media.codecs');
+  chromium.use(stealthPlugin);
+}
 
 export type BotType = 'microsoft' | 'google' | 'zoom';
 
@@ -66,33 +70,11 @@ async function launchContextWithTimeout(launchFn: () => Promise<BrowserContext>,
 async function createBrowserContext(url: string, correlationId: string, botType: BotType = 'google'): Promise<Page> {
   const size = { width: 1280, height: 720 };
 
-  // Base browser args used by all bots
-const baseBrowserArgs: string[] = [
-  '--no-sandbox',                  // CRITICAL FOR DOCKER
-    '--disable-dev-shm-usage',       // CRITICAL FOR DOCKER
+  // Minimal args for Windows compatibility
+  const baseBrowserArgs: string[] = [
+    '--no-sandbox',
+    '--disable-dev-shm-usage',
     '--disable-setuid-sandbox',
-    // --- YOUR EXISTING REQUIRED FLAGS ---
-    '--enable-usermedia-screen-capturing',
-    '--allow-http-screen-capture',
-    '--use-gl=angle',
-    '--use-angle=swiftshader',
-    `--window-size=${size.width},${size.height}`,
-    '--auto-accept-this-tab-capture',
-    '--enable-features=MediaRecorder',
-    '--enable-audio-service-out-of-process',
-    '--autoplay-policy=no-user-gesture-required',
-    
-    // --- NEW PERFORMANCE & SPEED FLAGS ---
-    '--disable-extensions',                     // Stops Chrome from loading heavy extensions in the profile
-    '--no-proxy-server',                        // Bypasses any local proxy delays
-    '--disable-background-networking',          // Stops Chrome from calling home to Google for updates
-    '--disable-background-timer-throttling',    // Forces JS to run at full speed even in background
-    '--disable-backgrounding-occluded-windows', // Stops Chrome from sleeping tabs
-    '--disable-renderer-backgrounding',         // Keeps the renderer thread at high priority
-    '--disable-client-side-phishing-detection', // Turns off Google's slow security scanner
-    '--disable-sync',                           // Prevents it from trying to sync  bookmarks/history
-    '--metrics-recording-only',                 // Stops reporting metrics to Google
-    '--mute-audio',                             // (Optional) Mutes output audio to save processing
   ];
 
   const fakeDeviceArgs: string[] = [
@@ -104,50 +86,42 @@ const baseBrowserArgs: string[] = [
     ? [...baseBrowserArgs, ...fakeDeviceArgs]
     : baseBrowserArgs;
 
-  const displayArgs = botType === 'microsoft'
-    ? ['--kiosk', '--start-maximized']
-    : [];
+  console.log(`${getCorrelationIdLog(correlationId)} Launching browser for ${botType} bot`);
 
-  console.log(`${getCorrelationIdLog(correlationId)} Launching browser for ${botType} bot (fake devices: ${botType === 'microsoft'})`);
+  const userDataDir = path.resolve('./chrome-profile');
+  
+  // Build launch options with optional executable path
+  const launchOptions: any = {
+    headless: false,
+    args: browserArgs,
+    permissions: ['camera', 'microphone'],
+    viewport: size,
+    ignoreHTTPSErrors: true,
+  };
 
-  const linuxX11UserAgent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
-
-  // Use launchPersistentContext, combining the old launch() and newContext() properties
+  // Only set executablePath if provided in config, otherwise let Playwright find it
+  if (config.chromeExecutablePath) {
+    launchOptions.executablePath = config.chromeExecutablePath;
+  }
+  
   const context = await launchContextWithTimeout(
-    async () => await chromium.launchPersistentContext('./chrome-profile', {
-      headless: false, // Kept false for local Mac testing POC
-      args: [
-        ...browserArgs,
-        ...displayArgs,
-      ],
-      ignoreDefaultArgs: ['--mute-audio'],
-executablePath: process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-      permissions: ['camera', 'microphone'],
-      viewport: size,
-      ignoreHTTPSErrors: true,
-      // userAgent: linuxX11UserAgent,
-      ...(process.env.NODE_ENV === 'development' && {
-        recordVideo: {
-          dir: './debug-videos/',
-          size: size,
-        },
-      }),
-    }),
+    async () => await chromium.launchPersistentContext(userDataDir, launchOptions),
     60000,
     correlationId
   );
 
-  // Grant permissions so Teams will play audio (Teams requires this unlike Google Meet)
+  console.log(`${getCorrelationIdLog(correlationId)} Browser context created successfully!`);
+
+  // Grant permissions
   await context.grantPermissions(['microphone', 'camera'], { origin: url });
 
-  // Persistent contexts open with a blank page by default. 
-  // We grab the existing one instead of creating a zombie tab.
+  // Get or create page
   const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
 
-  // Attach common error handlers
+  // Attach error handlers
   attachBrowserErrorHandlers(context, page, correlationId);
 
-  console.log(`${getCorrelationIdLog(correlationId)} Browser launched successfully using persistent profile!`);
+  console.log(`${getCorrelationIdLog(correlationId)} Browser launched successfully!`);
 
   return page;
 }

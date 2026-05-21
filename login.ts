@@ -1,19 +1,19 @@
-import { chromium } from 'playwright-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-
-chromium.use(StealthPlugin());
+import { chromium } from 'playwright';
+import * as path from 'path'; // 1. Import the path module
 
 (async () => {
-  console.log('Launching persistent browser using REAL Mac Chrome...');
-  
-  const context = await chromium.launchPersistentContext('./chrome-profile', {
-    headless: false,
-    // Point directly to your Mac's native Google Chrome
-    executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    channel: 'chrome'
-  });
+    console.log('Launching persistent browser using REAL Windows Chrome...');
 
-  const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
+    // 2. Resolve the relative path to an absolute path dynamically
+    const userDataDir = path.resolve('./chrome-profile'); 
+
+    const context = await chromium.launchPersistentContext(userDataDir, {
+        headless: false,
+        executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe',
+        channel: 'chrome' 
+    });
+
+    const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
   
   await page.goto('https://meet.google.com');
 
